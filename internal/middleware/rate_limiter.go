@@ -2,11 +2,11 @@ package middleware
 
 import (
 	"context"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 
@@ -19,7 +19,6 @@ const (
 	cleanupInterval = 2 * time.Minute
 )
 
-// uploadPrefixes identifies paths subject to the upload rate limit.
 var uploadPrefixes = []string{
 	"/api/v1/drive/upload",
 }
@@ -38,7 +37,7 @@ type counter struct {
 	resetAt time.Time
 }
 
-// NewRateLimiter creates a new RateLimiter instance with automatic cleanup of expired entries.
+// NewRateLimiter creates a new RateLimiter with automatic cleanup.
 func NewRateLimiter(rdb *redis.Client, cfg config.RateLimitConfig, logger *zap.Logger) *RateLimiter {
 	rl := &RateLimiter{
 		rdb:      rdb,
@@ -50,51 +49,39 @@ func NewRateLimiter(rdb *redis.Client, cfg config.RateLimitConfig, logger *zap.L
 	return rl
 }
 
-// Middleware returns a Gin middleware that enforces rate limits.
-func (rl *RateLimiter) Middleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		key, limit := rl.resolveKeyAndLimit(c)
+// Wrap returns middleware that enforces rate limits.
+func (rl *RateLimiter) Wrap(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key, limit := rl.resolveKeyAndLimit(r)
 
-		if !rl.allow(c.Request.Context(), key, limit) {
-			dto.RateLimited(c)
+		if !rl.allow(r.Context(), key, limit) {
+			dto.RateLimited(w)
 			return
 		}
 
-		c.Next()
-	}
+		next.ServeHTTP(w, r)
+	})
 }
 
-// resolveKeyAndLimit determines the rate limit key and threshold for the request.
-// Uses strings.Builder to avoid fmt.Sprintf allocations.
-func (rl *RateLimiter) resolveKeyAndLimit(c *gin.Context) (string, int) {
-	path := c.Request.URL.Path
+func (rl *RateLimiter) resolveKeyAndLimit(r *http.Request) (string, int) {
+	path := r.URL.Path
 
 	for _, prefix := range uploadPrefixes {
 		if strings.HasPrefix(path, prefix) {
-			if userID, exists := c.Get(ContextKeyUserID); exists {
-				return buildKey("rl:upload:", userID.(string)), rl.cfg.Upload
+			if uid, ok := GetUserID(r.Context()); ok {
+				return "rl:upload:" + uid, rl.cfg.Upload
 			}
-			return buildKey("rl:upload:ip:", c.ClientIP()), rl.cfg.Upload
+			return "rl:upload:ip:" + GetClientIP(r.Context()), rl.cfg.Upload
 		}
 	}
 
-	if userID, exists := c.Get(ContextKeyUserID); exists {
-		return buildKey("rl:user:", userID.(string)), rl.cfg.Authenticated
+	if uid, ok := GetUserID(r.Context()); ok {
+		return "rl:user:" + uid, rl.cfg.Authenticated
 	}
 
-	return buildKey("rl:ip:", c.ClientIP()), rl.cfg.Public
+	return "rl:ip:" + GetClientIP(r.Context()), rl.cfg.Public
 }
 
-// buildKey concatenates prefix + value with minimal allocation.
-func buildKey(prefix, value string) string {
-	var b strings.Builder
-	b.Grow(len(prefix) + len(value))
-	b.WriteString(prefix)
-	b.WriteString(value)
-	return b.String()
-}
-
-// allow checks rate limit via Redis, falling back to in-memory.
 func (rl *RateLimiter) allow(ctx context.Context, key string, limit int) bool {
 	if rl.rdb == nil {
 		return rl.allowInMemory(key, limit)
@@ -112,7 +99,6 @@ func (rl *RateLimiter) allow(ctx context.Context, key string, limit int) bool {
 	return incrCmd.Val() <= int64(limit)
 }
 
-// allowInMemory provides a simple in-memory rate limiter as fallback.
 func (rl *RateLimiter) allowInMemory(key string, limit int) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
@@ -128,7 +114,6 @@ func (rl *RateLimiter) allowInMemory(key string, limit int) bool {
 	return c.count <= limit
 }
 
-// cleanupLoop periodically removes expired entries from the in-memory counter map.
 func (rl *RateLimiter) cleanupLoop() {
 	ticker := time.NewTicker(cleanupInterval)
 	defer ticker.Stop()

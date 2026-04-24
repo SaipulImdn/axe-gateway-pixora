@@ -20,36 +20,30 @@ import (
 )
 
 func main() {
-	// Load configuration
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Initialize logger
 	logger := initLogger(cfg.Log.Level)
 	defer func() { _ = logger.Sync() }()
 
-	// Connect to Redis
 	rdb := initRedis(cfg.Redis.URL, logger)
 	if rdb != nil {
 		defer func() { _ = rdb.Close() }()
 	}
 
-	// Setup router
-	engine := router.Setup(cfg, rdb, logger)
+	handler := router.Setup(cfg, rdb, logger)
 
-	// Create HTTP server
 	srv := &http.Server{
 		Addr:              cfg.Address(),
-		Handler:           engine,
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    1 << 20, // 1 MB
+		MaxHeaderBytes:    1 << 20,
 	}
 
-	// Start server in a goroutine
 	go func() {
 		logger.Info("starting gateway",
 			zap.String("address", cfg.Address()),
@@ -60,7 +54,6 @@ func main() {
 		}
 	}()
 
-	// Graceful shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-quit
@@ -76,7 +69,6 @@ func main() {
 	logger.Info("gateway stopped")
 }
 
-// initLogger creates a structured Zap logger with the given level.
 func initLogger(level string) *zap.Logger {
 	var zapLevel zapcore.Level
 	if err := zapLevel.UnmarshalText([]byte(level)); err != nil {
@@ -101,7 +93,6 @@ func initLogger(level string) *zap.Logger {
 	return logger
 }
 
-// initRedis creates a Redis client. Returns nil if connection fails (gateway runs without Redis).
 func initRedis(url string, logger *zap.Logger) *redis.Client {
 	opts, err := redis.ParseURL(url)
 	if err != nil {

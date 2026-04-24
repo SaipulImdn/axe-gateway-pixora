@@ -1,20 +1,22 @@
 package middleware
 
-import (
-	"time"
+import "net/http"
 
-	"github.com/gin-contrib/cors"
-	"github.com/gin-gonic/gin"
-)
+// CORS returns middleware that adds permissive CORS headers matching the backend.
+func CORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Access-Control-Allow-Origin", "*")
+		h.Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS")
+		h.Set("Access-Control-Allow-Headers", "*")
+		h.Set("Access-Control-Expose-Headers", "Content-Length, Content-Type, Authorization")
+		h.Set("Access-Control-Max-Age", "3600")
 
-// CORSMiddleware returns a permissive CORS configuration matching the backend.
-func CORSMiddleware() gin.HandlerFunc {
-	return cors.New(cors.Config{
-		AllowAllOrigins:  true,
-		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"},
-		AllowHeaders:     []string{"*"},
-		ExposeHeaders:    []string{"Content-Length", "Content-Type", "Authorization"},
-		AllowCredentials: false,
-		MaxAge:           3600 * time.Second,
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next.ServeHTTP(w, r)
 	})
 }

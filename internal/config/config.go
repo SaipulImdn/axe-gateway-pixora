@@ -67,7 +67,6 @@ func Load() (*Config, error) {
 	v.AutomaticEnv()
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 
-	// Defaults
 	v.SetDefault("GATEWAY_HOST", "0.0.0.0")
 	v.SetDefault("GATEWAY_PORT", "9090")
 	v.SetDefault("PIXORA_BACKEND_URL", "https://inappropriate-vanessa-pixora-435590e7.koyeb.app")
@@ -81,7 +80,6 @@ func Load() (*Config, error) {
 	v.SetDefault("PROXY_TIMEOUT_DOWNLOAD", 300)
 	v.SetDefault("LOG_LEVEL", "info")
 
-	// Attempt to read .env file; ignore error if not found
 	_ = v.ReadInConfig()
 
 	cfg := &Config{

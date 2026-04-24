@@ -1,63 +1,102 @@
 package middleware
 
 import (
+	"context"
+	"net"
+	"net/http"
+	"strings"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 )
 
-const logMessage = "request completed"
-
-// skipLogPaths are high-frequency paths that should not be logged to reduce noise.
+// skipLogPaths are high-frequency paths that should not be logged.
 var skipLogPaths = map[string]bool{
 	"/health": true,
 }
 
-// LoggerMiddleware logs every request with structured fields.
-// Health check requests are skipped to reduce log volume.
-func LoggerMiddleware(logger *zap.Logger) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		path := c.Request.URL.Path
+// statusWriter wraps http.ResponseWriter to capture the status code.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+	size   int
+}
 
-		// Skip logging for health checks (Koyeb polls every few seconds)
-		if skipLogPaths[path] {
-			c.Next()
-			return
-		}
+func (sw *statusWriter) WriteHeader(code int) {
+	sw.status = code
+	sw.ResponseWriter.WriteHeader(code)
+}
 
-		start := time.Now()
+func (sw *statusWriter) Write(b []byte) (int, error) {
+	n, err := sw.ResponseWriter.Write(b)
+	sw.size += n
+	return n, err
+}
 
-		c.Next()
-
-		duration := time.Since(start)
-		status := c.Writer.Status()
-
-		fields := []zap.Field{
-			zap.String("method", c.Request.Method),
-			zap.String("path", path),
-			zap.String("query", c.Request.URL.RawQuery),
-			zap.Int("status", status),
-			zap.Duration("duration", duration),
-			zap.String("client_ip", c.ClientIP()),
-			zap.Int("body_size", c.Writer.Size()),
-		}
-
-		if userID, exists := c.Get(ContextKeyUserID); exists {
-			fields = append(fields, zap.String("user_id", userID.(string)))
-		}
-
-		if len(c.Errors) > 0 {
-			fields = append(fields, zap.String("errors", c.Errors.String()))
-		}
-
-		switch {
-		case status >= 500:
-			logger.Error(logMessage, fields...)
-		case status >= 400:
-			logger.Warn(logMessage, fields...)
-		default:
-			logger.Info(logMessage, fields...)
-		}
+// Flush implements http.Flusher for streaming support.
+func (sw *statusWriter) Flush() {
+	if f, ok := sw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
 	}
+}
+
+// Logger returns middleware that logs requests with structured fields.
+// Also extracts client IP and stores it in context for downstream use.
+func Logger(logger *zap.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Extract and store client IP in context
+			clientIP := extractClientIP(r)
+			ctx := context.WithValue(r.Context(), ClientIPKey, clientIP)
+			r = r.WithContext(ctx)
+
+			if skipLogPaths[r.URL.Path] {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			start := time.Now()
+			sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+
+			next.ServeHTTP(sw, r)
+
+			fields := []zap.Field{
+				zap.String("method", r.Method),
+				zap.String("path", r.URL.Path),
+				zap.String("query", r.URL.RawQuery),
+				zap.Int("status", sw.status),
+				zap.Duration("duration", time.Since(start)),
+				zap.String("client_ip", clientIP),
+				zap.Int("body_size", sw.size),
+			}
+
+			if uid, ok := GetUserID(r.Context()); ok {
+				fields = append(fields, zap.String("user_id", uid))
+			}
+
+			switch {
+			case sw.status >= 500:
+				logger.Error("request completed", fields...)
+			case sw.status >= 400:
+				logger.Warn("request completed", fields...)
+			default:
+				logger.Info("request completed", fields...)
+			}
+		})
+	}
+}
+
+// extractClientIP gets the real client IP from X-Forwarded-For or RemoteAddr.
+func extractClientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if ip, _, ok := strings.Cut(xff, ","); ok {
+			return strings.TrimSpace(ip)
+		}
+		return strings.TrimSpace(xff)
+	}
+	if xri := r.Header.Get("X-Real-Ip"); xri != "" {
+		return xri
+	}
+	host, _, _ := net.SplitHostPort(r.RemoteAddr)
+	return host
 }

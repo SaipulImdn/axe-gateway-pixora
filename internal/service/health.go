@@ -3,6 +3,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -40,15 +41,33 @@ func NewHealthChecker(rdb *redis.Client, backendURL string, logger *zap.Logger) 
 					Timeout: 3 * time.Second,
 				}).DialContext,
 				TLSHandshakeTimeout: 3 * time.Second,
-				DisableKeepAlives:   true, // Health checks are infrequent, no need to keep connections
+				DisableKeepAlives:   true,
 			},
 		},
 		logger: logger,
 	}
 }
 
-// Check returns the aggregated health status of all dependencies.
-// Backend and Redis are checked in parallel to minimize latency.
+// ServeHTTP handles GET and HEAD /health requests.
+func (h *HealthChecker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	result := h.Check(r.Context())
+
+	status := http.StatusOK
+	if result.Backend == statusDown || result.Redis == statusDown {
+		status = http.StatusServiceUnavailable
+	}
+
+	if r.Method == http.MethodHead {
+		w.WriteHeader(status)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(result)
+}
+
+// Check returns the aggregated health status of all dependencies in parallel.
 func (h *HealthChecker) Check(ctx context.Context) dto.HealthResponse {
 	var backendStatus, redisStatus string
 	var wg sync.WaitGroup
@@ -72,27 +91,17 @@ func (h *HealthChecker) Check(ctx context.Context) dto.HealthResponse {
 	}
 }
 
-// IsHealthy returns true if all dependencies are healthy.
-func (h *HealthChecker) IsHealthy(ctx context.Context) bool {
-	resp := h.Check(ctx)
-	return resp.Backend == statusOK && resp.Redis == statusOK
-}
-
-// checkBackend pings the backend health endpoint.
 func (h *HealthChecker) checkBackend(ctx context.Context) string {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	url := fmt.Sprintf("%s/health", h.backendURL)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/health", h.backendURL), nil)
 	if err != nil {
-		h.logger.Warn("failed to create backend health request", zap.Error(err))
 		return statusDown
 	}
 
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
-		h.logger.Warn("backend health check failed", zap.Error(err))
 		return statusDown
 	}
 	defer resp.Body.Close()
@@ -103,7 +112,6 @@ func (h *HealthChecker) checkBackend(ctx context.Context) string {
 	return statusDown
 }
 
-// checkRedis pings the Redis connection.
 func (h *HealthChecker) checkRedis(ctx context.Context) string {
 	if h.rdb == nil {
 		return statusDown
@@ -113,7 +121,6 @@ func (h *HealthChecker) checkRedis(ctx context.Context) string {
 	defer cancel()
 
 	if err := h.rdb.Ping(ctx).Err(); err != nil {
-		h.logger.Warn("redis health check failed", zap.Error(err))
 		return statusDown
 	}
 	return statusOK

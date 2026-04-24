@@ -4,6 +4,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"time"
 
@@ -22,26 +23,35 @@ const (
 type HealthChecker struct {
 	rdb        *redis.Client
 	backendURL string
+	httpClient *http.Client
 	logger     *zap.Logger
 }
 
-// NewHealthChecker creates a new HealthChecker.
+// NewHealthChecker creates a new HealthChecker with a dedicated HTTP client.
 func NewHealthChecker(rdb *redis.Client, backendURL string, logger *zap.Logger) *HealthChecker {
 	return &HealthChecker{
 		rdb:        rdb,
 		backendURL: backendURL,
-		logger:     logger,
+		httpClient: &http.Client{
+			Timeout: 5 * time.Second,
+			Transport: &http.Transport{
+				DialContext: (&net.Dialer{
+					Timeout: 3 * time.Second,
+				}).DialContext,
+				TLSHandshakeTimeout: 3 * time.Second,
+			},
+		},
+		logger: logger,
 	}
 }
 
 // Check returns the aggregated health status of all dependencies.
 func (h *HealthChecker) Check(ctx context.Context) dto.HealthResponse {
-	resp := dto.HealthResponse{
+	return dto.HealthResponse{
 		Gateway: statusOK,
 		Backend: h.checkBackend(ctx),
 		Redis:   h.checkRedis(ctx),
 	}
-	return resp
 }
 
 // IsHealthy returns true if all dependencies are healthy.
@@ -62,7 +72,7 @@ func (h *HealthChecker) checkBackend(ctx context.Context) string {
 		return statusDown
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := h.httpClient.Do(req)
 	if err != nil {
 		h.logger.Warn("backend health check failed", zap.Error(err))
 		return statusDown

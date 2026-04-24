@@ -17,6 +17,7 @@ import (
 
 const (
 	rateLimitWindow = 60 * time.Second
+	cleanupInterval = 2 * time.Minute
 )
 
 // uploadPrefixes identifies paths subject to the upload rate limit.
@@ -39,14 +40,19 @@ type counter struct {
 	resetAt time.Time
 }
 
-// NewRateLimiter creates a new RateLimiter instance.
+// NewRateLimiter creates a new RateLimiter instance with automatic cleanup of expired entries.
 func NewRateLimiter(rdb *redis.Client, cfg config.RateLimitConfig, logger *zap.Logger) *RateLimiter {
-	return &RateLimiter{
+	rl := &RateLimiter{
 		rdb:      rdb,
 		cfg:      cfg,
 		logger:   logger,
 		counters: make(map[string]*counter),
 	}
+
+	// Background goroutine to clean up expired in-memory counters
+	go rl.cleanupLoop()
+
+	return rl
 }
 
 // Middleware returns a Gin middleware that enforces rate limits.
@@ -119,4 +125,21 @@ func (rl *RateLimiter) checkInMemory(key string, limit int) bool {
 
 	c.count++
 	return c.count <= limit
+}
+
+// cleanupLoop periodically removes expired entries from the in-memory counter map.
+func (rl *RateLimiter) cleanupLoop() {
+	ticker := time.NewTicker(cleanupInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		rl.mu.Lock()
+		now := time.Now()
+		for key, c := range rl.counters {
+			if now.After(c.resetAt) {
+				delete(rl.counters, key)
+			}
+		}
+		rl.mu.Unlock()
+	}
 }

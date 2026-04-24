@@ -30,23 +30,34 @@ var hopByHopHeaders = map[string]bool{
 
 // ProxyHandler forwards requests to the backend service.
 type ProxyHandler struct {
-	backendURL string
-	proxyCfg   config.ProxyConfig
-	client     *httpclient.Client
-	logger     *zap.Logger
+	backendURL      string
+	proxyCfg        config.ProxyConfig
+	defaultClient   *httpclient.Client
+	longLivedClient *httpclient.Client
+	logger          *zap.Logger
 }
 
 // NewProxyHandler creates a new ProxyHandler.
 func NewProxyHandler(backendURL string, proxyCfg config.ProxyConfig, logger *zap.Logger) *ProxyHandler {
-	client := httpclient.New(
+	defaultClient := httpclient.New(
 		httpclient.WithTimeout(time.Duration(proxyCfg.TimeoutDefault)*time.Second),
 		httpclient.WithMaxRetries(1),
 	)
+	// Separate client for upload/download with longer timeout
+	maxTimeout := proxyCfg.TimeoutUpload
+	if proxyCfg.TimeoutDownload > maxTimeout {
+		maxTimeout = proxyCfg.TimeoutDownload
+	}
+	longLivedClient := httpclient.New(
+		httpclient.WithTimeout(time.Duration(maxTimeout)*time.Second),
+		httpclient.WithMaxRetries(0),
+	)
 	return &ProxyHandler{
-		backendURL: strings.TrimRight(backendURL, "/"),
-		proxyCfg:   proxyCfg,
-		client:     client,
-		logger:     logger,
+		backendURL:      strings.TrimRight(backendURL, "/"),
+		proxyCfg:        proxyCfg,
+		defaultClient:   defaultClient,
+		longLivedClient: longLivedClient,
+		logger:          logger,
 	}
 }
 
@@ -57,11 +68,10 @@ func (h *ProxyHandler) Forward(c *gin.Context) {
 		targetURL += "?" + c.Request.URL.RawQuery
 	}
 
-	timeout := h.resolveTimeout(c.Request.URL.Path, c.Request.Method)
+	timeout, client := h.resolveTimeoutAndClient(c.Request.URL.Path)
 	ctx, cancel := context.WithTimeout(c.Request.Context(), timeout)
 	defer cancel()
 
-	// Build the upstream request
 	proxyReq, err := http.NewRequestWithContext(ctx, c.Request.Method, targetURL, c.Request.Body)
 	if err != nil {
 		h.logger.Error("failed to create proxy request", zap.Error(err))
@@ -69,25 +79,10 @@ func (h *ProxyHandler) Forward(c *gin.Context) {
 		return
 	}
 
-	// Copy headers, skipping hop-by-hop
-	for key, values := range c.Request.Header {
-		if hopByHopHeaders[key] {
-			continue
-		}
-		for _, v := range values {
-			proxyReq.Header.Add(key, v)
-		}
-	}
-
-	// Set X-Forwarded headers
-	proxyReq.Header.Set("X-Forwarded-For", c.ClientIP())
-	proxyReq.Header.Set("X-Forwarded-Host", c.Request.Host)
-	proxyReq.Header.Set("X-Forwarded-Proto", c.Request.URL.Scheme)
-
-	// Preserve content length for multipart uploads
+	h.copyRequestHeaders(c, proxyReq)
 	proxyReq.ContentLength = c.Request.ContentLength
 
-	resp, err := h.client.Do(ctx, proxyReq)
+	resp, err := client.Do(ctx, proxyReq)
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			dto.GatewayTimeout(c)
@@ -99,7 +94,42 @@ func (h *ProxyHandler) Forward(c *gin.Context) {
 	}
 	defer resp.Body.Close()
 
-	// Copy response headers
+	h.copyResponseHeaders(c, resp)
+	c.Writer.WriteHeader(resp.StatusCode)
+
+	if _, err := io.Copy(c.Writer, resp.Body); err != nil {
+		h.logger.Warn("error streaming response body", zap.Error(err))
+	}
+}
+
+// copyRequestHeaders copies incoming headers to the proxy request, skipping hop-by-hop headers.
+func (h *ProxyHandler) copyRequestHeaders(c *gin.Context, proxyReq *http.Request) {
+	for key, values := range c.Request.Header {
+		if hopByHopHeaders[key] {
+			continue
+		}
+		for _, v := range values {
+			proxyReq.Header.Add(key, v)
+		}
+	}
+
+	proxyReq.Header.Set("X-Forwarded-For", c.ClientIP())
+	proxyReq.Header.Set("X-Forwarded-Host", c.Request.Host)
+
+	// Detect protocol from X-Forwarded-Proto or TLS
+	proto := c.GetHeader("X-Forwarded-Proto")
+	if proto == "" {
+		if c.Request.TLS != nil {
+			proto = "https"
+		} else {
+			proto = "http"
+		}
+	}
+	proxyReq.Header.Set("X-Forwarded-Proto", proto)
+}
+
+// copyResponseHeaders copies backend response headers, skipping hop-by-hop headers.
+func (h *ProxyHandler) copyResponseHeaders(c *gin.Context, resp *http.Response) {
 	for key, values := range resp.Header {
 		if hopByHopHeaders[key] {
 			continue
@@ -108,22 +138,15 @@ func (h *ProxyHandler) Forward(c *gin.Context) {
 			c.Writer.Header().Add(key, v)
 		}
 	}
-
-	c.Writer.WriteHeader(resp.StatusCode)
-
-	// Stream the response body
-	if _, err := io.Copy(c.Writer, resp.Body); err != nil {
-		h.logger.Warn("error streaming response body", zap.Error(err))
-	}
 }
 
-// resolveTimeout returns the appropriate timeout for the given path and method.
-func (h *ProxyHandler) resolveTimeout(path, method string) time.Duration {
+// resolveTimeoutAndClient returns the appropriate timeout and HTTP client for the given path.
+func (h *ProxyHandler) resolveTimeoutAndClient(path string) (time.Duration, *httpclient.Client) {
 	if strings.Contains(path, "/upload") {
-		return time.Duration(h.proxyCfg.TimeoutUpload) * time.Second
+		return time.Duration(h.proxyCfg.TimeoutUpload) * time.Second, h.longLivedClient
 	}
 	if strings.Contains(path, "/download") {
-		return time.Duration(h.proxyCfg.TimeoutDownload) * time.Second
+		return time.Duration(h.proxyCfg.TimeoutDownload) * time.Second, h.longLivedClient
 	}
-	return time.Duration(h.proxyCfg.TimeoutDefault) * time.Second
+	return time.Duration(h.proxyCfg.TimeoutDefault) * time.Second, h.defaultClient
 }

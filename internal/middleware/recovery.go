@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"net/http"
+	"runtime/debug"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -9,7 +10,7 @@ import (
 	"github.com/SaipulImdn/axe-gateway-pixora/internal/dto"
 )
 
-// RecoveryMiddleware catches panics and returns a 500 error response.
+// RecoveryMiddleware catches panics, logs the stack trace, and returns a 500 error response.
 func RecoveryMiddleware(logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		defer func() {
@@ -18,6 +19,7 @@ func RecoveryMiddleware(logger *zap.Logger) gin.HandlerFunc {
 					zap.Any("error", r),
 					zap.String("path", c.Request.URL.Path),
 					zap.String("method", c.Request.Method),
+					zap.String("stack", string(debug.Stack())),
 				)
 				dto.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "An unexpected error occurred.")
 			}

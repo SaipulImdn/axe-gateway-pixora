@@ -2,7 +2,6 @@
 package middleware
 
 import (
-	"context"
 	"crypto/sha256"
 	"fmt"
 	"strings"
@@ -34,62 +33,26 @@ var publicPaths = map[string]bool{
 // AuthMiddleware validates JWT tokens and checks the Redis blacklist.
 func AuthMiddleware(jwtSecret string, rdb *redis.Client, logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Skip auth for public routes
 		if publicPaths[c.Request.URL.Path] {
 			c.Next()
 			return
 		}
 
-		authHeader := c.GetHeader("Authorization")
-		if authHeader == "" {
-			dto.Unauthorized(c, "Missing authorization header.")
+		tokenStr, ok := extractBearerToken(c)
+		if !ok {
 			return
 		}
 
-		parts := strings.SplitN(authHeader, " ", 2)
-		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
-			dto.Unauthorized(c, "Invalid authorization header format. Expected: Bearer <token>")
+		claims, ok := validateToken(c, tokenStr, jwtSecret, logger)
+		if !ok {
 			return
 		}
 
-		tokenStr := parts[1]
-
-		// Parse and validate the JWT token
-		claims := jwt.MapClaims{}
-		token, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
-			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
-			}
-			return []byte(jwtSecret), nil
-		})
-		if err != nil || !token.Valid {
-			logger.Warn("invalid JWT token", zap.Error(err))
-			dto.Unauthorized(c, "Invalid or expired token.")
+		if !checkBlacklist(c, tokenStr, rdb, logger) {
 			return
 		}
 
-		// Verify token_type is "access"
-		tokenType, _ := claims["token_type"].(string)
-		if tokenType != "access" {
-			dto.Unauthorized(c, "Invalid token type.")
-			return
-		}
-
-		// Check token blacklist in Redis
-		if rdb != nil {
-			hash := sha256.Sum256([]byte(tokenStr))
-			blacklistKey := fmt.Sprintf("blacklist:%x", hash)
-			exists, err := rdb.Exists(context.Background(), blacklistKey).Result()
-			if err != nil {
-				logger.Error("redis blacklist check failed", zap.Error(err))
-				// Fail open: allow request if Redis is unavailable
-			} else if exists > 0 {
-				dto.Unauthorized(c, "Token has been revoked.")
-				return
-			}
-		}
-
-		// Store user ID in context for downstream use
+		// Store user ID and raw token in context for downstream use
 		if sub, ok := claims["sub"].(string); ok {
 			c.Set(ContextKeyUserID, sub)
 		}
@@ -97,4 +60,72 @@ func AuthMiddleware(jwtSecret string, rdb *redis.Client, logger *zap.Logger) gin
 
 		c.Next()
 	}
+}
+
+// extractBearerToken extracts the Bearer token from the Authorization header.
+// Returns the token string and true on success, or aborts the request and returns false.
+func extractBearerToken(c *gin.Context) (string, bool) {
+	authHeader := c.GetHeader("Authorization")
+	if authHeader == "" {
+		dto.Unauthorized(c, "Missing authorization header.")
+		return "", false
+	}
+
+	parts := strings.SplitN(authHeader, " ", 2)
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+		dto.Unauthorized(c, "Invalid authorization header format. Expected: Bearer <token>")
+		return "", false
+	}
+
+	return parts[1], true
+}
+
+// validateToken parses and validates the JWT token, ensuring it's an access token.
+// Returns the claims and true on success, or aborts the request and returns false.
+func validateToken(c *gin.Context, tokenStr, jwtSecret string, logger *zap.Logger) (jwt.MapClaims, bool) {
+	claims := jwt.MapClaims{}
+	token, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (any, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+		}
+		return []byte(jwtSecret), nil
+	})
+	if err != nil || !token.Valid {
+		logger.Warn("invalid JWT token", zap.Error(err))
+		dto.Unauthorized(c, "Invalid or expired token.")
+		return nil, false
+	}
+
+	tokenType, _ := claims["token_type"].(string)
+	if tokenType != "access" {
+		dto.Unauthorized(c, "Invalid token type.")
+		return nil, false
+	}
+
+	return claims, true
+}
+
+// checkBlacklist verifies the token is not revoked via Redis blacklist.
+// Returns true if the token is allowed, or aborts the request and returns false.
+func checkBlacklist(c *gin.Context, tokenStr string, rdb *redis.Client, logger *zap.Logger) bool {
+	if rdb == nil {
+		return true
+	}
+
+	hash := sha256.Sum256([]byte(tokenStr))
+	blacklistKey := fmt.Sprintf("blacklist:%x", hash)
+
+	exists, err := rdb.Exists(c.Request.Context(), blacklistKey).Result()
+	if err != nil {
+		logger.Error("redis blacklist check failed", zap.Error(err))
+		// Fail open: allow request if Redis is unavailable
+		return true
+	}
+
+	if exists > 0 {
+		dto.Unauthorized(c, "Token has been revoked.")
+		return false
+	}
+
+	return true
 }

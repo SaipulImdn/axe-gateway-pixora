@@ -1,0 +1,73 @@
+services:
+  axe-gateway:
+    build: .
+    ports:
+      - "9090:9090"
+    environment:
+      GATEWAY_HOST: "0.0.0.0"
+      GATEWAY_PORT: "9090"
+      PIXORA_BACKEND_URL: "https://inappropriate-vanessa-pixora-435590e7.koyeb.app"
+      JWT_SECRET: "${JWT_SECRET}"
+      REDIS_URL: "redis://redis:6379"
+      RATE_LIMIT_PUBLIC: "20"
+      RATE_LIMIT_AUTHENTICATED: "100"
+      RATE_LIMIT_UPLOAD: "10"
+      PROXY_TIMEOUT_DEFAULT: "30"
+      PROXY_TIMEOUT_UPLOAD: "300"
+      PROXY_TIMEOUT_DOWNLOAD: "300"
+      LOG_LEVEL: "info"
+    depends_on:
+      pixora-backend:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  pixora-backend:
+    image: pixora-backend:latest
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: "postgres://pixora:pixora@postgres:5432/pixora?sslmode=disable"
+      REDIS_URL: "redis://redis:6379"
+      JWT_SECRET: "${JWT_SECRET}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: pixora
+      POSTGRES_PASSWORD: pixora
+      POSTGRES_DB: pixora
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pixora"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:

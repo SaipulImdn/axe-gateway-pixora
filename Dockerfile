@@ -8,7 +8,7 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOTOOLCHAIN=auto go build -ldflags="-s -w" -o axe-gateway ./cmd/gateway
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o axe-gateway ./cmd/gateway
 
 # Stage 2: Runtime
 FROM alpine:3.20

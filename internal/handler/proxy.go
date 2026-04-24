@@ -19,10 +19,9 @@ import (
 
 // ProxyHandler forwards requests to the backend using httputil.ReverseProxy.
 type ProxyHandler struct {
-	defaultProxy *httputil.ReverseProxy
-	uploadProxy  *httputil.ReverseProxy
-	logger       *zap.Logger
-	// Pre-computed timeout durations
+	defaultProxy    *httputil.ReverseProxy
+	uploadProxy     *httputil.ReverseProxy
+	logger          *zap.Logger
 	timeoutDefault  time.Duration
 	timeoutUpload   time.Duration
 	timeoutDownload time.Duration
@@ -43,28 +42,25 @@ func NewProxyHandler(backendURL string, proxyCfg config.ProxyConfig, logger *zap
 		timeoutDownload: timeoutDownload,
 	}
 
-	h.defaultProxy = h.newProxy(target, timeoutDefault)
-	h.uploadProxy = h.newProxy(target, max(timeoutUpload, timeoutDownload))
+	h.defaultProxy = h.newProxy(target, timeoutDefault, false)
+	h.uploadProxy = h.newProxy(target, max(timeoutUpload, timeoutDownload), true)
 
 	return h
 }
 
 // newProxy creates an httputil.ReverseProxy with the given timeout.
-func (h *ProxyHandler) newProxy(target *url.URL, timeout time.Duration) *httputil.ReverseProxy {
+// streaming enables FlushInterval for download/upload responses.
+func (h *ProxyHandler) newProxy(target *url.URL, timeout time.Duration, streaming bool) *httputil.ReverseProxy {
 	proxy := &httputil.ReverseProxy{
-		// Rewrite replaces the deprecated Director. It rewrites the request
-		// to target the backend while preserving all original headers including Authorization.
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(target)
 			pr.Out.Host = target.Host
 
-			// Explicitly copy Authorization header — Rewrite strips it by default
-			// when proxying to a different host (security measure we need to override).
+			// Preserve Authorization header across different hosts
 			if auth := pr.In.Header.Get("Authorization"); auth != "" {
 				pr.Out.Header.Set("Authorization", auth)
 			}
 
-			// Set X-Forwarded headers
 			if clientIP := middleware.GetClientIP(pr.Out.Context()); clientIP != "" {
 				pr.Out.Header.Set("X-Forwarded-For", clientIP)
 			}
@@ -95,8 +91,13 @@ func (h *ProxyHandler) newProxy(target *url.URL, timeout time.Duration) *httputi
 		},
 
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			if r.Context().Err() == context.DeadlineExceeded {
-				dto.GatewayTimeout(w)
+			// Context cancellation during streaming is normal (client disconnect).
+			// Don't treat it as an error — just log at debug level.
+			if r.Context().Err() != nil {
+				h.logger.Debug("proxy request cancelled",
+					zap.String("path", r.URL.Path),
+					zap.Error(err),
+				)
 				return
 			}
 			h.logger.Error("proxy error", zap.Error(err), zap.String("path", r.URL.Path))
@@ -104,11 +105,31 @@ func (h *ProxyHandler) newProxy(target *url.URL, timeout time.Duration) *httputi
 		},
 	}
 
+	// Enable streaming flush for upload/download proxy to avoid buffering
+	// large responses in memory. This flushes data to the client immediately.
+	if streaming {
+		proxy.FlushInterval = -1 // flush immediately
+	}
+
 	return proxy
 }
 
 // ServeHTTP routes the request to the appropriate proxy based on the path.
+// Panics from ReverseProxy (e.g. "net/http: abort Handler" during streaming)
+// are caught and logged gracefully.
 func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			// "net/http: abort Handler" is expected when client disconnects
+			// during streaming. Log it but don't crash.
+			h.logger.Warn("proxy panic recovered",
+				zap.Any("error", rec),
+				zap.String("path", r.URL.Path),
+				zap.String("method", r.Method),
+			)
+		}
+	}()
+
 	path := r.URL.Path
 
 	if strings.Contains(path, "/upload") || strings.Contains(path, "/download") {

@@ -2,7 +2,6 @@ package middleware
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -27,10 +26,9 @@ var uploadPrefixes = []string{
 
 // RateLimiter enforces per-IP and per-user request rate limits.
 type RateLimiter struct {
-	rdb    *redis.Client
-	cfg    config.RateLimitConfig
-	logger *zap.Logger
-	// In-memory fallback when Redis is unavailable
+	rdb      *redis.Client
+	cfg      config.RateLimitConfig
+	logger   *zap.Logger
 	mu       sync.Mutex
 	counters map[string]*counter
 }
@@ -48,10 +46,7 @@ func NewRateLimiter(rdb *redis.Client, cfg config.RateLimitConfig, logger *zap.L
 		logger:   logger,
 		counters: make(map[string]*counter),
 	}
-
-	// Background goroutine to clean up expired in-memory counters
 	go rl.cleanupLoop()
-
 	return rl
 }
 
@@ -60,8 +55,7 @@ func (rl *RateLimiter) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		key, limit := rl.resolveKeyAndLimit(c)
 
-		allowed := rl.checkRedis(c.Request.Context(), key, limit)
-		if !allowed {
+		if !rl.allow(c.Request.Context(), key, limit) {
 			dto.RateLimited(c)
 			return
 		}
@@ -71,32 +65,39 @@ func (rl *RateLimiter) Middleware() gin.HandlerFunc {
 }
 
 // resolveKeyAndLimit determines the rate limit key and threshold for the request.
+// Uses strings.Builder to avoid fmt.Sprintf allocations.
 func (rl *RateLimiter) resolveKeyAndLimit(c *gin.Context) (string, int) {
 	path := c.Request.URL.Path
 
-	// Check if this is an upload path
 	for _, prefix := range uploadPrefixes {
 		if strings.HasPrefix(path, prefix) {
 			if userID, exists := c.Get(ContextKeyUserID); exists {
-				return fmt.Sprintf("rl:upload:%s", userID), rl.cfg.Upload
+				return buildKey("rl:upload:", userID.(string)), rl.cfg.Upload
 			}
-			return fmt.Sprintf("rl:upload:ip:%s", c.ClientIP()), rl.cfg.Upload
+			return buildKey("rl:upload:ip:", c.ClientIP()), rl.cfg.Upload
 		}
 	}
 
-	// Authenticated user
 	if userID, exists := c.Get(ContextKeyUserID); exists {
-		return fmt.Sprintf("rl:user:%s", userID), rl.cfg.Authenticated
+		return buildKey("rl:user:", userID.(string)), rl.cfg.Authenticated
 	}
 
-	// Public / unauthenticated
-	return fmt.Sprintf("rl:ip:%s", c.ClientIP()), rl.cfg.Public
+	return buildKey("rl:ip:", c.ClientIP()), rl.cfg.Public
 }
 
-// checkRedis attempts Redis-based rate limiting, falling back to in-memory.
-func (rl *RateLimiter) checkRedis(ctx context.Context, key string, limit int) bool {
+// buildKey concatenates prefix + value with minimal allocation.
+func buildKey(prefix, value string) string {
+	var b strings.Builder
+	b.Grow(len(prefix) + len(value))
+	b.WriteString(prefix)
+	b.WriteString(value)
+	return b.String()
+}
+
+// allow checks rate limit via Redis, falling back to in-memory.
+func (rl *RateLimiter) allow(ctx context.Context, key string, limit int) bool {
 	if rl.rdb == nil {
-		return rl.checkInMemory(key, limit)
+		return rl.allowInMemory(key, limit)
 	}
 
 	pipe := rl.rdb.Pipeline()
@@ -104,15 +105,15 @@ func (rl *RateLimiter) checkRedis(ctx context.Context, key string, limit int) bo
 	pipe.Expire(ctx, key, rateLimitWindow)
 	_, err := pipe.Exec(ctx)
 	if err != nil {
-		rl.logger.Warn("redis rate limit check failed, falling back to in-memory", zap.Error(err))
-		return rl.checkInMemory(key, limit)
+		rl.logger.Warn("redis rate limit failed, falling back to in-memory", zap.Error(err))
+		return rl.allowInMemory(key, limit)
 	}
 
 	return incrCmd.Val() <= int64(limit)
 }
 
-// checkInMemory provides a simple in-memory rate limiter as fallback.
-func (rl *RateLimiter) checkInMemory(key string, limit int) bool {
+// allowInMemory provides a simple in-memory rate limiter as fallback.
+func (rl *RateLimiter) allowInMemory(key string, limit int) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 

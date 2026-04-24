@@ -7,12 +7,26 @@ import (
 	"go.uber.org/zap"
 )
 
+const logMessage = "request completed"
+
+// skipLogPaths are high-frequency paths that should not be logged to reduce noise.
+var skipLogPaths = map[string]bool{
+	"/health": true,
+}
+
 // LoggerMiddleware logs every request with structured fields.
+// Health check requests are skipped to reduce log volume.
 func LoggerMiddleware(logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		start := time.Now()
 		path := c.Request.URL.Path
-		query := c.Request.URL.RawQuery
+
+		// Skip logging for health checks (Koyeb polls every few seconds)
+		if skipLogPaths[path] {
+			c.Next()
+			return
+		}
+
+		start := time.Now()
 
 		c.Next()
 
@@ -22,7 +36,7 @@ func LoggerMiddleware(logger *zap.Logger) gin.HandlerFunc {
 		fields := []zap.Field{
 			zap.String("method", c.Request.Method),
 			zap.String("path", path),
-			zap.String("query", query),
+			zap.String("query", c.Request.URL.RawQuery),
 			zap.Int("status", status),
 			zap.Duration("duration", duration),
 			zap.String("client_ip", c.ClientIP()),
@@ -39,11 +53,11 @@ func LoggerMiddleware(logger *zap.Logger) gin.HandlerFunc {
 
 		switch {
 		case status >= 500:
-			logger.Error("request completed", fields...)
+			logger.Error(logMessage, fields...)
 		case status >= 400:
-			logger.Warn("request completed", fields...)
+			logger.Warn(logMessage, fields...)
 		default:
-			logger.Info("request completed", fields...)
+			logger.Info(logMessage, fields...)
 		}
 	}
 }

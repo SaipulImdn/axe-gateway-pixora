@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -39,6 +40,7 @@ func NewHealthChecker(rdb *redis.Client, backendURL string, logger *zap.Logger) 
 					Timeout: 3 * time.Second,
 				}).DialContext,
 				TLSHandshakeTimeout: 3 * time.Second,
+				DisableKeepAlives:   true, // Health checks are infrequent, no need to keep connections
 			},
 		},
 		logger: logger,
@@ -46,11 +48,27 @@ func NewHealthChecker(rdb *redis.Client, backendURL string, logger *zap.Logger) 
 }
 
 // Check returns the aggregated health status of all dependencies.
+// Backend and Redis are checked in parallel to minimize latency.
 func (h *HealthChecker) Check(ctx context.Context) dto.HealthResponse {
+	var backendStatus, redisStatus string
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		backendStatus = h.checkBackend(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		redisStatus = h.checkRedis(ctx)
+	}()
+
+	wg.Wait()
+
 	return dto.HealthResponse{
 		Gateway: statusOK,
-		Backend: h.checkBackend(ctx),
-		Redis:   h.checkRedis(ctx),
+		Backend: backendStatus,
+		Redis:   redisStatus,
 	}
 }
 

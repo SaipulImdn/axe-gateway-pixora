@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -15,6 +16,17 @@ import (
 	"github.com/SaipulImdn/axe-gateway-pixora/internal/dto"
 	"github.com/SaipulImdn/axe-gateway-pixora/pkg/httpclient"
 )
+
+// streamBufSize is the buffer size for streaming proxy responses (32 KB).
+const streamBufSize = 32 * 1024
+
+// bufPool reuses byte slices for io.CopyBuffer to reduce GC pressure.
+var bufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, streamBufSize)
+		return &buf
+	},
+}
 
 // hopByHopHeaders are headers that should not be forwarded by a proxy.
 var hopByHopHeaders = map[string]bool{
@@ -35,38 +47,43 @@ type ProxyHandler struct {
 	defaultClient   *httpclient.Client
 	longLivedClient *httpclient.Client
 	logger          *zap.Logger
+	// Pre-computed timeout durations to avoid per-request conversion
+	timeoutDefault  time.Duration
+	timeoutUpload   time.Duration
+	timeoutDownload time.Duration
 }
 
 // NewProxyHandler creates a new ProxyHandler.
 func NewProxyHandler(backendURL string, proxyCfg config.ProxyConfig, logger *zap.Logger) *ProxyHandler {
+	timeoutDefault := time.Duration(proxyCfg.TimeoutDefault) * time.Second
+	timeoutUpload := time.Duration(proxyCfg.TimeoutUpload) * time.Second
+	timeoutDownload := time.Duration(proxyCfg.TimeoutDownload) * time.Second
+
 	defaultClient := httpclient.New(
-		httpclient.WithTimeout(time.Duration(proxyCfg.TimeoutDefault)*time.Second),
+		httpclient.WithTimeout(timeoutDefault),
 		httpclient.WithMaxRetries(1),
 	)
-	// Separate client for upload/download with longer timeout
-	maxTimeout := proxyCfg.TimeoutUpload
-	if proxyCfg.TimeoutDownload > maxTimeout {
-		maxTimeout = proxyCfg.TimeoutDownload
-	}
+	longTimeout := max(timeoutUpload, timeoutDownload)
 	longLivedClient := httpclient.New(
-		httpclient.WithTimeout(time.Duration(maxTimeout)*time.Second),
+		httpclient.WithTimeout(longTimeout),
 		httpclient.WithMaxRetries(0),
 	)
+
 	return &ProxyHandler{
 		backendURL:      strings.TrimRight(backendURL, "/"),
 		proxyCfg:        proxyCfg,
 		defaultClient:   defaultClient,
 		longLivedClient: longLivedClient,
 		logger:          logger,
+		timeoutDefault:  timeoutDefault,
+		timeoutUpload:   timeoutUpload,
+		timeoutDownload: timeoutDownload,
 	}
 }
 
 // Forward proxies the incoming request to the backend.
 func (h *ProxyHandler) Forward(c *gin.Context) {
-	targetURL := h.backendURL + c.Request.URL.Path
-	if c.Request.URL.RawQuery != "" {
-		targetURL += "?" + c.Request.URL.RawQuery
-	}
+	targetURL := h.buildTargetURL(c)
 
 	timeout, client := h.resolveTimeoutAndClient(c.Request.URL.Path)
 	ctx, cancel := context.WithTimeout(c.Request.Context(), timeout)
@@ -97,9 +114,35 @@ func (h *ProxyHandler) Forward(c *gin.Context) {
 	h.copyResponseHeaders(c, resp)
 	c.Writer.WriteHeader(resp.StatusCode)
 
-	if _, err := io.Copy(c.Writer, resp.Body); err != nil {
+	// Stream response body using pooled buffer to reduce GC pressure
+	bufPtr := bufPool.Get().(*[]byte)
+	_, err = io.CopyBuffer(c.Writer, resp.Body, *bufPtr)
+	bufPool.Put(bufPtr)
+	if err != nil {
 		h.logger.Warn("error streaming response body", zap.Error(err))
 	}
+}
+
+// buildTargetURL constructs the backend URL using strings.Builder to minimize allocations.
+func (h *ProxyHandler) buildTargetURL(c *gin.Context) string {
+	path := c.Request.URL.Path
+	query := c.Request.URL.RawQuery
+
+	// Pre-calculate capacity: backendURL + path + "?" + query
+	capacity := len(h.backendURL) + len(path)
+	if query != "" {
+		capacity += 1 + len(query)
+	}
+
+	var b strings.Builder
+	b.Grow(capacity)
+	b.WriteString(h.backendURL)
+	b.WriteString(path)
+	if query != "" {
+		b.WriteByte('?')
+		b.WriteString(query)
+	}
+	return b.String()
 }
 
 // copyRequestHeaders copies incoming headers to the proxy request, skipping hop-by-hop headers.
@@ -116,7 +159,6 @@ func (h *ProxyHandler) copyRequestHeaders(c *gin.Context, proxyReq *http.Request
 	proxyReq.Header.Set("X-Forwarded-For", c.ClientIP())
 	proxyReq.Header.Set("X-Forwarded-Host", c.Request.Host)
 
-	// Detect protocol from X-Forwarded-Proto or TLS
 	proto := c.GetHeader("X-Forwarded-Proto")
 	if proto == "" {
 		if c.Request.TLS != nil {
@@ -143,10 +185,10 @@ func (h *ProxyHandler) copyResponseHeaders(c *gin.Context, resp *http.Response) 
 // resolveTimeoutAndClient returns the appropriate timeout and HTTP client for the given path.
 func (h *ProxyHandler) resolveTimeoutAndClient(path string) (time.Duration, *httpclient.Client) {
 	if strings.Contains(path, "/upload") {
-		return time.Duration(h.proxyCfg.TimeoutUpload) * time.Second, h.longLivedClient
+		return h.timeoutUpload, h.longLivedClient
 	}
 	if strings.Contains(path, "/download") {
-		return time.Duration(h.proxyCfg.TimeoutDownload) * time.Second, h.longLivedClient
+		return h.timeoutDownload, h.longLivedClient
 	}
-	return time.Duration(h.proxyCfg.TimeoutDefault) * time.Second, h.defaultClient
+	return h.timeoutDefault, h.defaultClient
 }

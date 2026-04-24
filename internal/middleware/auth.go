@@ -3,7 +3,7 @@ package middleware
 
 import (
 	"crypto/sha256"
-	"fmt"
+	"encoding/hex"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -18,6 +18,9 @@ import (
 const (
 	ContextKeyUserID = "user_id"
 	ContextKeyToken  = "raw_token"
+
+	bearerPrefix    = "Bearer "
+	blacklistPrefix = "blacklist:"
 )
 
 // publicPaths lists routes that do not require JWT authentication.
@@ -31,7 +34,10 @@ var publicPaths = map[string]bool{
 }
 
 // AuthMiddleware validates JWT tokens and checks the Redis blacklist.
+// The JWT secret bytes are pre-computed once to avoid per-request allocation.
 func AuthMiddleware(jwtSecret string, rdb *redis.Client, logger *zap.Logger) gin.HandlerFunc {
+	secretBytes := []byte(jwtSecret)
+
 	return func(c *gin.Context) {
 		if publicPaths[c.Request.URL.Path] {
 			c.Next()
@@ -43,7 +49,7 @@ func AuthMiddleware(jwtSecret string, rdb *redis.Client, logger *zap.Logger) gin
 			return
 		}
 
-		claims, ok := validateToken(c, tokenStr, jwtSecret, logger)
+		claims, ok := validateToken(c, tokenStr, secretBytes, logger)
 		if !ok {
 			return
 		}
@@ -52,7 +58,6 @@ func AuthMiddleware(jwtSecret string, rdb *redis.Client, logger *zap.Logger) gin
 			return
 		}
 
-		// Store user ID and raw token in context for downstream use
 		if sub, ok := claims["sub"].(string); ok {
 			c.Set(ContextKeyUserID, sub)
 		}
@@ -63,7 +68,6 @@ func AuthMiddleware(jwtSecret string, rdb *redis.Client, logger *zap.Logger) gin
 }
 
 // extractBearerToken extracts the Bearer token from the Authorization header.
-// Returns the token string and true on success, or aborts the request and returns false.
 func extractBearerToken(c *gin.Context) (string, bool) {
 	authHeader := c.GetHeader("Authorization")
 	if authHeader == "" {
@@ -71,24 +75,29 @@ func extractBearerToken(c *gin.Context) (string, bool) {
 		return "", false
 	}
 
-	parts := strings.SplitN(authHeader, " ", 2)
-	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
-		dto.Unauthorized(c, "Invalid authorization header format. Expected: Bearer <token>")
-		return "", false
+	// Zero-alloc prefix check instead of SplitN
+	token, found := strings.CutPrefix(authHeader, bearerPrefix)
+	if !found {
+		// Also handle lowercase "bearer "
+		token, found = strings.CutPrefix(authHeader, "bearer ")
+		if !found {
+			dto.Unauthorized(c, "Invalid authorization header format. Expected: Bearer <token>")
+			return "", false
+		}
 	}
 
-	return parts[1], true
+	return token, true
 }
 
 // validateToken parses and validates the JWT token, ensuring it's an access token.
-// Returns the claims and true on success, or aborts the request and returns false.
-func validateToken(c *gin.Context, tokenStr, jwtSecret string, logger *zap.Logger) (jwt.MapClaims, bool) {
+// Accepts pre-computed secret bytes to avoid per-request []byte conversion.
+func validateToken(c *gin.Context, tokenStr string, secretBytes []byte, logger *zap.Logger) (jwt.MapClaims, bool) {
 	claims := jwt.MapClaims{}
 	token, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (any, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+			return nil, jwt.ErrSignatureInvalid
 		}
-		return []byte(jwtSecret), nil
+		return secretBytes, nil
 	})
 	if err != nil || !token.Valid {
 		logger.Warn("invalid JWT token", zap.Error(err))
@@ -106,19 +115,23 @@ func validateToken(c *gin.Context, tokenStr, jwtSecret string, logger *zap.Logge
 }
 
 // checkBlacklist verifies the token is not revoked via Redis blacklist.
-// Returns true if the token is allowed, or aborts the request and returns false.
+// Uses pre-allocated buffer for hex encoding to minimize allocations.
 func checkBlacklist(c *gin.Context, tokenStr string, rdb *redis.Client, logger *zap.Logger) bool {
 	if rdb == nil {
 		return true
 	}
 
 	hash := sha256.Sum256([]byte(tokenStr))
-	blacklistKey := fmt.Sprintf("blacklist:%x", hash)
+
+	// "blacklist:" (10) + hex-encoded sha256 (64) = 74 bytes
+	var buf [74]byte
+	copy(buf[:], blacklistPrefix)
+	hex.Encode(buf[len(blacklistPrefix):], hash[:])
+	blacklistKey := string(buf[:])
 
 	exists, err := rdb.Exists(c.Request.Context(), blacklistKey).Result()
 	if err != nil {
 		logger.Error("redis blacklist check failed", zap.Error(err))
-		// Fail open: allow request if Redis is unavailable
 		return true
 	}
 

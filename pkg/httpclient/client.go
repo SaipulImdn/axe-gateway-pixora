@@ -34,20 +34,23 @@ func WithMaxRetries(n int) Option {
 }
 
 // New creates a new HTTP client with the given options.
+// HTTP/2 is enabled by default for better multiplexing to the backend.
 func New(opts ...Option) *Client {
 	c := &Client{
 		http: &http.Client{
 			Timeout: 30 * time.Second,
 			Transport: &http.Transport{
 				DialContext: (&net.Dialer{
-					Timeout:   10 * time.Second,
+					Timeout:   5 * time.Second,
 					KeepAlive: 30 * time.Second,
 				}).DialContext,
 				MaxIdleConns:          100,
-				MaxIdleConnsPerHost:   20,
+				MaxIdleConnsPerHost:   50,
 				IdleConnTimeout:       90 * time.Second,
-				TLSHandshakeTimeout:   10 * time.Second,
+				TLSHandshakeTimeout:   5 * time.Second,
 				ResponseHeaderTimeout: 30 * time.Second,
+				ForceAttemptHTTP2:     true,
+				DisableCompression:    false,
 			},
 		},
 		maxRetries: 1,
@@ -76,7 +79,7 @@ func (c *Client) Do(ctx context.Context, req *http.Request) (*http.Response, err
 		resp, err = c.http.Do(req)
 		if err != nil {
 			if i < attempts-1 && retriable {
-				time.Sleep(time.Duration(i+1) * 200 * time.Millisecond)
+				time.Sleep(time.Duration(i+1) * 100 * time.Millisecond)
 				continue
 			}
 			return nil, fmt.Errorf("http request failed after %d attempts: %w", i+1, err)
@@ -86,7 +89,7 @@ func (c *Client) Do(ctx context.Context, req *http.Request) (*http.Response, err
 			if i < attempts-1 {
 				_, _ = io.Copy(io.Discard, resp.Body)
 				resp.Body.Close()
-				time.Sleep(time.Duration(i+1) * 200 * time.Millisecond)
+				time.Sleep(time.Duration(i+1) * 100 * time.Millisecond)
 				continue
 			}
 		}

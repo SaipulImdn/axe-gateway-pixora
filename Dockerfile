@@ -1,5 +1,5 @@
 # Stage 1: Build
-FROM golang:1.23-alpine AS builder
+FROM golang:1.24-alpine AS builder
 
 WORKDIR /app
 
@@ -8,7 +8,7 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o axe-gateway ./cmd/gateway
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOTOOLCHAIN=auto go build -ldflags="-s -w" -o axe-gateway ./cmd/gateway
 
 # Stage 2: Runtime
 FROM alpine:3.20

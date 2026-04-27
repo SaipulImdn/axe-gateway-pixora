@@ -6,18 +6,21 @@ services:
     environment:
       GATEWAY_HOST: "0.0.0.0"
       GATEWAY_PORT: "9090"
-      PIXORA_BACKEND_URL: "https://inappropriate-vanessa-pixora-435590e7.koyeb.app"
+      PIXORA_BACKEND_URL: "http://pixora-backend:8080"
+      CLOCKWERK_MEDIA_URL: "http://clockwerk-media:8081"
       JWT_SECRET: "${JWT_SECRET}"
       REDIS_URL: "redis://redis:6379"
-      RATE_LIMIT_PUBLIC: "20"
-      RATE_LIMIT_AUTHENTICATED: "100"
-      RATE_LIMIT_UPLOAD: "10"
+      RATE_LIMIT_PUBLIC: "60"
+      RATE_LIMIT_AUTHENTICATED: "600"
+      RATE_LIMIT_UPLOAD: "30"
       PROXY_TIMEOUT_DEFAULT: "30"
       PROXY_TIMEOUT_UPLOAD: "300"
       PROXY_TIMEOUT_DOWNLOAD: "300"
       LOG_LEVEL: "info"
     depends_on:
       pixora-backend:
+        condition: service_started
+      clockwerk-media:
         condition: service_started
       redis:
         condition: service_healthy
@@ -27,10 +30,19 @@ services:
     image: pixora-backend:latest
     ports:
       - "8080:8080"
-    environment:
-      DATABASE_URL: "postgres://pixora:pixora@postgres:5432/pixora?sslmode=disable"
-      REDIS_URL: "redis://redis:6379"
-      JWT_SECRET: "${JWT_SECRET}"
+    env_file: ./envs/backend.env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  clockwerk-media:
+    image: clockwerk-media-pixora:latest
+    ports:
+      - "8081:8081"
+    env_file: ./envs/media.env
     depends_on:
       postgres:
         condition: service_healthy

@@ -23,17 +23,19 @@ const (
 
 // HealthChecker aggregates health status from gateway dependencies.
 type HealthChecker struct {
-	rdb        *redis.Client
-	backendURL string
-	httpClient *http.Client
-	logger     *zap.Logger
+	rdb          *redis.Client
+	pixoraURL    string
+	clockwerkURL string
+	httpClient   *http.Client
+	logger       *zap.Logger
 }
 
 // NewHealthChecker creates a new HealthChecker with a dedicated HTTP client.
-func NewHealthChecker(rdb *redis.Client, backendURL string, logger *zap.Logger) *HealthChecker {
+func NewHealthChecker(rdb *redis.Client, pixoraURL, clockwerkURL string, logger *zap.Logger) *HealthChecker {
 	return &HealthChecker{
-		rdb:        rdb,
-		backendURL: backendURL,
+		rdb:          rdb,
+		pixoraURL:    pixoraURL,
+		clockwerkURL: clockwerkURL,
 		httpClient: &http.Client{
 			Timeout: 5 * time.Second,
 			Transport: &http.Transport{
@@ -53,7 +55,7 @@ func (h *HealthChecker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	result := h.Check(r.Context())
 
 	status := http.StatusOK
-	if result.Backend == statusDown || result.Redis == statusDown {
+	if result.PixoraBackend == statusDown || result.ClockwerkMedia == statusDown || result.Redis == statusDown {
 		status = http.StatusServiceUnavailable
 	}
 
@@ -69,13 +71,17 @@ func (h *HealthChecker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // Check returns the aggregated health status of all dependencies in parallel.
 func (h *HealthChecker) Check(ctx context.Context) dto.HealthResponse {
-	var backendStatus, redisStatus string
+	var pixoraStatus, clockwerkStatus, redisStatus string
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(3)
 
 	go func() {
 		defer wg.Done()
-		backendStatus = h.checkBackend(ctx)
+		pixoraStatus = h.checkURL(ctx, h.pixoraURL)
+	}()
+	go func() {
+		defer wg.Done()
+		clockwerkStatus = h.checkURL(ctx, h.clockwerkURL)
 	}()
 	go func() {
 		defer wg.Done()
@@ -85,17 +91,19 @@ func (h *HealthChecker) Check(ctx context.Context) dto.HealthResponse {
 	wg.Wait()
 
 	return dto.HealthResponse{
-		Gateway: statusOK,
-		Backend: backendStatus,
-		Redis:   redisStatus,
+		Gateway:        statusOK,
+		PixoraBackend:  pixoraStatus,
+		ClockwerkMedia: clockwerkStatus,
+		Redis:          redisStatus,
 	}
 }
 
-func (h *HealthChecker) checkBackend(ctx context.Context) string {
+// checkURL pings a backend health endpoint.
+func (h *HealthChecker) checkURL(ctx context.Context, baseURL string) string {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/health", h.backendURL), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/health", baseURL), nil)
 	if err != nil {
 		return statusDown
 	}
@@ -112,6 +120,7 @@ func (h *HealthChecker) checkBackend(ctx context.Context) string {
 	return statusDown
 }
 
+// checkRedis pings the Redis connection.
 func (h *HealthChecker) checkRedis(ctx context.Context) string {
 	if h.rdb == nil {
 		return statusDown

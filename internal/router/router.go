@@ -15,18 +15,32 @@ import (
 
 // Setup configures the HTTP handler with all routes and middleware.
 func Setup(cfg *config.Config, rdb *redis.Client, logger *zap.Logger) http.Handler {
-	proxy := handler.NewProxyHandler(cfg.Backend.URL, cfg.Proxy, logger)
-	health := service.NewHealthChecker(rdb, cfg.Backend.URL, logger)
+	// Create proxy handlers for each backend service
+	pixoraProxy := handler.NewProxyHandler(cfg.Backend.PixoraURL, cfg.Proxy, logger)
+	clockwerkProxy := handler.NewProxyHandler(cfg.Backend.ClockwerkURL, cfg.Proxy, logger)
+
+	health := service.NewHealthChecker(rdb, cfg.Backend.PixoraURL, cfg.Backend.ClockwerkURL, logger)
 	rateLimiter := middleware.NewRateLimiter(rdb, cfg.RateLimit, logger)
 
 	mux := http.NewServeMux()
 
-	// Health check
+	// Health check (aggregated)
 	mux.Handle("GET /health", health)
 	mux.Handle("HEAD /health", health)
 
-	// All API routes → proxy to backend
-	mux.Handle("/api/v1/", proxy)
+	// ── Routes to pixora-backend ─────────────────────────────────
+	mux.Handle("/api/v1/auth/", pixoraProxy)
+	mux.Handle("/api/v1/notifications/", pixoraProxy)
+	mux.Handle("/api/v1/activity", pixoraProxy)
+	mux.Handle("/api/v1/favorites", pixoraProxy)
+	mux.Handle("/api/v1/favorites/", pixoraProxy)
+	mux.Handle("/api/v1/share/", pixoraProxy)
+
+	// ── Routes to clockwerk-media-pixora ─────────────────────────
+	mux.Handle("/api/v1/drive/", clockwerkProxy)
+	mux.Handle("/api/v1/sync/", clockwerkProxy)
+	mux.Handle("/api/v1/duplicates/", clockwerkProxy)
+	mux.Handle("/api/v1/faces/", clockwerkProxy)
 
 	// Middleware chain (outermost first):
 	// Recovery → CORS → Logger → RateLimiter → Auth → mux

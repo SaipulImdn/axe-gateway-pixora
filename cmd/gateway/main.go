@@ -47,7 +47,8 @@ func main() {
 	go func() {
 		logger.Info("starting gateway",
 			zap.String("address", cfg.Address()),
-			zap.String("backend", cfg.Backend.URL),
+			zap.String("pixora_backend", cfg.Backend.PixoraURL),
+			zap.String("clockwerk_media", cfg.Backend.ClockwerkURL),
 		)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Fatal("server failed", zap.Error(err))

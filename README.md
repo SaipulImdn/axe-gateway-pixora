@@ -1,51 +1,54 @@
 # Axe Gateway Pixora
 
-API Gateway for the Pixora Backend microservice. Built with Go, Gin, and clean architecture.
+API Gateway for Pixora microservices. Routes requests to the correct backend service based on path prefix.
+
+## Services
+
+| Path Prefix | Backend Service |
+|---|---|
+| `/api/v1/auth/*`, `/api/v1/activity`, `/api/v1/favorites/*`, `/api/v1/notifications/*`, `/api/v1/share/*` | pixora-backend |
+| `/api/v1/drive/*`, `/api/v1/sync/*`, `/api/v1/duplicates/*`, `/api/v1/faces/*` | clockwerk-media-pixora |
 
 ## Features
 
-- Reverse proxy to pixora-backend with streaming support
+- Path-based routing to 2 backend microservices
 - JWT validation with Redis-based token blacklist
 - Per-IP and per-user rate limiting (Redis + in-memory fallback)
 - CORS, structured logging (Zap), panic recovery
-- Aggregated health checks (gateway + backend + Redis)
-- Multi-stage Docker build for minimal image size
+- Aggregated health checks (gateway + both backends + Redis)
+- Streaming support for upload/download with extended timeouts
+- Native Go `net/http` + `httputil.ReverseProxy` — zero framework overhead
 
 ## Quick Start
 
 ```bash
-# Copy and configure environment
 cp .env.example .env
-
-# Run locally
+# Edit .env with your service URLs and JWT secret
 make run
-
-# Or with Docker Compose
-docker compose up -d
 ```
 
-## Architecture
+## Health Check
 
 ```
-cmd/gateway/main.go          → Entry point, DI, graceful shutdown
-internal/config/              → Viper-based configuration
-internal/middleware/          → Auth, CORS, rate limiter, logger, recovery
-internal/handler/proxy.go    → Reverse proxy with timeout & retry
-internal/service/health.go   → Health check aggregator
-internal/router/router.go    → Route definitions
-internal/dto/                → Standardized error/response types
-pkg/httpclient/              → Reusable HTTP client with retry
+GET /health
+```
+```json
+{
+  "gateway": "ok",
+  "pixora_backend": "ok",
+  "clockwerk_media": "ok",
+  "redis": "ok"
+}
 ```
 
-## Deployment
+## Environment Variables
 
-Built for Koyeb deployment via Docker Hub. See `.github/workflows/docker-publish.yml`.
-
-Environment variables required in Koyeb dashboard:
-
-| Variable | Example |
+| Variable | Description |
 |---|---|
-| `GATEWAY_PORT` | `9090` |
-| `PIXORA_BACKEND_URL` | `https://<service>.koyeb.app` |
-| `JWT_SECRET` | Same as backend |
-| `REDIS_URL` | Managed Redis URL |
+| `PIXORA_BACKEND_URL` | URL of pixora-backend service |
+| `CLOCKWERK_MEDIA_URL` | URL of clockwerk-media-pixora service |
+| `JWT_SECRET` | Shared JWT secret (same across all services) |
+| `REDIS_URL` | Redis connection URL |
+| `RATE_LIMIT_PUBLIC` | Rate limit for public routes (req/min) |
+| `RATE_LIMIT_AUTHENTICATED` | Rate limit for authenticated routes (req/min) |
+| `RATE_LIMIT_UPLOAD` | Rate limit for upload routes (req/min) |

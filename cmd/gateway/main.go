@@ -40,6 +40,8 @@ func main() {
 		Addr:              cfg.Address(),
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      5 * time.Minute, // generous for upload/download streaming
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}
@@ -100,6 +102,14 @@ func initRedis(url string, logger *zap.Logger) *redis.Client {
 		logger.Warn("invalid redis URL, running without Redis", zap.Error(err))
 		return nil
 	}
+
+	// Tune connection pool for gateway workload.
+	opts.PoolSize = 50     // max open connections
+	opts.MinIdleConns = 10 // keep warm connections ready
+	opts.DialTimeout = 5 * time.Second
+	opts.ReadTimeout = 3 * time.Second
+	opts.WriteTimeout = 3 * time.Second
+	opts.PoolTimeout = 4 * time.Second
 
 	rdb := redis.NewClient(opts)
 

@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"hash/fnv"
 	"net/http"
 	"strings"
 	"sync"
@@ -17,17 +18,16 @@ import (
 const (
 	rateLimitWindow = 60 * time.Second
 	cleanupInterval = 2 * time.Minute
+	numShards       = 32 // power-of-two for fast modulo via bitmask
 )
 
 var uploadPrefixes = []string{
 	"/api/v1/drive/upload",
 }
 
-// RateLimiter enforces per-IP and per-user request rate limits.
-type RateLimiter struct {
-	rdb      *redis.Client
-	cfg      config.RateLimitConfig
-	logger   *zap.Logger
+// shard holds a subset of rate-limit counters behind its own mutex,
+// reducing lock contention under high concurrency.
+type shard struct {
 	mu       sync.Mutex
 	counters map[string]*counter
 }
@@ -37,13 +37,24 @@ type counter struct {
 	resetAt time.Time
 }
 
+// RateLimiter enforces per-IP and per-user request rate limits.
+// In-memory counters are distributed across shards to minimise mutex contention.
+type RateLimiter struct {
+	rdb    *redis.Client
+	cfg    config.RateLimitConfig
+	logger *zap.Logger
+	shards [numShards]shard
+}
+
 // NewRateLimiter creates a new RateLimiter with automatic cleanup.
 func NewRateLimiter(rdb *redis.Client, cfg config.RateLimitConfig, logger *zap.Logger) *RateLimiter {
 	rl := &RateLimiter{
-		rdb:      rdb,
-		cfg:      cfg,
-		logger:   logger,
-		counters: make(map[string]*counter),
+		rdb:    rdb,
+		cfg:    cfg,
+		logger: logger,
+	}
+	for i := range rl.shards {
+		rl.shards[i].counters = make(map[string]*counter)
 	}
 	go rl.cleanupLoop()
 	return rl
@@ -99,14 +110,22 @@ func (rl *RateLimiter) allow(ctx context.Context, key string, limit int) bool {
 	return incrCmd.Val() <= int64(limit)
 }
 
+// getShard returns the shard for the given key using FNV-1a hash.
+func (rl *RateLimiter) getShard(key string) *shard {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	return &rl.shards[h.Sum32()&(numShards-1)]
+}
+
 func (rl *RateLimiter) allowInMemory(key string, limit int) bool {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
+	s := rl.getShard(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	now := time.Now()
-	c, exists := rl.counters[key]
+	c, exists := s.counters[key]
 	if !exists || now.After(c.resetAt) {
-		rl.counters[key] = &counter{count: 1, resetAt: now.Add(rateLimitWindow)}
+		s.counters[key] = &counter{count: 1, resetAt: now.Add(rateLimitWindow)}
 		return true
 	}
 
@@ -119,13 +138,16 @@ func (rl *RateLimiter) cleanupLoop() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		rl.mu.Lock()
 		now := time.Now()
-		for key, c := range rl.counters {
-			if now.After(c.resetAt) {
-				delete(rl.counters, key)
+		for i := range rl.shards {
+			s := &rl.shards[i]
+			s.mu.Lock()
+			for key, c := range s.counters {
+				if now.After(c.resetAt) {
+					delete(s.counters, key)
+				}
 			}
+			s.mu.Unlock()
 		}
-		rl.mu.Unlock()
 	}
 }

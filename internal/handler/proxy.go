@@ -17,6 +17,24 @@ import (
 	"github.com/SaipulImdn/axe-gateway-pixora/internal/middleware"
 )
 
+// sharedTransport is reused across all proxy handlers to maximise connection
+// pooling between the gateway and its backends. A single pool avoids the
+// overhead of separate TCP/TLS handshakes per proxy instance.
+var sharedTransport = &http.Transport{
+	DialContext: (&net.Dialer{
+		Timeout:   5 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext,
+	MaxIdleConns:          200,
+	MaxIdleConnsPerHost:   100,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   5 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+	ForceAttemptHTTP2:     true,
+	// ResponseHeaderTimeout is NOT set here because it differs per proxy
+	// (default vs upload/download). We use per-request context deadlines instead.
+}
+
 // ProxyHandler forwards requests to the backend using httputil.ReverseProxy.
 type ProxyHandler struct {
 	defaultProxy    *httputil.ReverseProxy
@@ -42,15 +60,15 @@ func NewProxyHandler(backendURL string, proxyCfg config.ProxyConfig, logger *zap
 		timeoutDownload: timeoutDownload,
 	}
 
-	h.defaultProxy = h.newProxy(target, timeoutDefault, false)
-	h.uploadProxy = h.newProxy(target, max(timeoutUpload, timeoutDownload), true)
+	h.defaultProxy = h.newProxy(target, false)
+	h.uploadProxy = h.newProxy(target, true)
 
 	return h
 }
 
-// newProxy creates an httputil.ReverseProxy with the given timeout.
+// newProxy creates an httputil.ReverseProxy backed by the shared transport.
 // streaming enables FlushInterval for download/upload responses.
-func (h *ProxyHandler) newProxy(target *url.URL, timeout time.Duration, streaming bool) *httputil.ReverseProxy {
+func (h *ProxyHandler) newProxy(target *url.URL, streaming bool) *httputil.ReverseProxy {
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(target)
@@ -77,22 +95,10 @@ func (h *ProxyHandler) newProxy(target *url.URL, timeout time.Duration, streamin
 			pr.Out.Header.Set("X-Forwarded-Proto", proto)
 		},
 
-		Transport: &http.Transport{
-			DialContext: (&net.Dialer{
-				Timeout:   5 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			MaxIdleConns:          100,
-			MaxIdleConnsPerHost:   50,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   5 * time.Second,
-			ResponseHeaderTimeout: timeout,
-			ForceAttemptHTTP2:     true,
-		},
+		Transport: sharedTransport,
 
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			// Context cancellation during streaming is normal (client disconnect).
-			// Don't treat it as an error — just log at debug level.
 			if r.Context().Err() != nil {
 				h.logger.Debug("proxy request cancelled",
 					zap.String("path", r.URL.Path),
@@ -115,13 +121,9 @@ func (h *ProxyHandler) newProxy(target *url.URL, timeout time.Duration, streamin
 }
 
 // ServeHTTP routes the request to the appropriate proxy based on the path.
-// Panics from ReverseProxy (e.g. "net/http: abort Handler" during streaming)
-// are caught and logged gracefully.
 func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		if rec := recover(); rec != nil {
-			// "net/http: abort Handler" is expected when client disconnects
-			// during streaming. Log it but don't crash.
 			h.logger.Warn("proxy panic recovered",
 				zap.Any("error", rec),
 				zap.String("path", r.URL.Path),

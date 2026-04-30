@@ -17,16 +17,19 @@ import (
 const (
 	bearerPrefix    = "Bearer "
 	blacklistPrefix = "blacklist:"
+	// blacklistKeyLen = len("blacklist:") + hex-encoded SHA-256 (64 chars) = 74
+	blacklistKeyLen = 74
 )
 
 // publicPaths lists routes that do not require JWT authentication.
-var publicPaths = map[string]bool{
-	"/api/v1/auth/signup":       true,
-	"/api/v1/auth/signin":       true,
-	"/api/v1/auth/google":       true,
-	"/api/v1/auth/refresh":      true,
-	"/api/v1/auth/set-password": true,
-	"/health":                   true,
+// Using a map[string]struct{} avoids the 1-byte overhead per entry of map[string]bool.
+var publicPaths = map[string]struct{}{
+	"/api/v1/auth/signup":       {},
+	"/api/v1/auth/signin":       {},
+	"/api/v1/auth/google":       {},
+	"/api/v1/auth/refresh":      {},
+	"/api/v1/auth/set-password": {},
+	"/health":                   {},
 }
 
 // Auth returns middleware that validates JWT tokens and checks the Redis blacklist.
@@ -35,7 +38,7 @@ func Auth(jwtSecret string, rdb *redis.Client, logger *zap.Logger) func(http.Han
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if publicPaths[r.URL.Path] {
+			if _, ok := publicPaths[r.URL.Path]; ok {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -106,13 +109,15 @@ func validateToken(w http.ResponseWriter, tokenStr string, secretBytes []byte, l
 	return claims, true
 }
 
+// checkBlacklist verifies the token is not revoked.
+// Uses a stack-allocated [74]byte buffer to build the Redis key without heap allocation.
 func checkBlacklist(w http.ResponseWriter, r *http.Request, tokenStr string, rdb *redis.Client, logger *zap.Logger) bool {
 	if rdb == nil {
 		return true
 	}
 
 	hash := sha256.Sum256([]byte(tokenStr))
-	var buf [74]byte
+	var buf [blacklistKeyLen]byte
 	copy(buf[:], blacklistPrefix)
 	hex.Encode(buf[len(blacklistPrefix):], hash[:])
 

@@ -4,6 +4,7 @@ package dto
 import (
 	"encoding/json"
 	"net/http"
+	"sync"
 )
 
 // Error codes used across the gateway.
@@ -22,14 +23,42 @@ type ErrorResponse struct {
 	Message string `json:"message"`
 }
 
+// bufPool reuses byte buffers to reduce allocations on every error response.
+var bufPool = sync.Pool{
+	New: func() any {
+		// Pre-allocate a reasonable size for JSON error responses.
+		b := make([]byte, 0, 128)
+		return &b
+	},
+}
+
 // WriteError writes a standardized JSON error response.
+// It uses a pooled buffer to avoid per-request allocations from json.NewEncoder.
 func WriteError(w http.ResponseWriter, status int, code, message string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(ErrorResponse{
+	bp := bufPool.Get().(*[]byte)
+	buf := (*bp)[:0]
+
+	data, err := json.Marshal(ErrorResponse{
 		Error:   code,
 		Message: message,
 	})
+	if err != nil {
+		// Fallback: write directly (should never happen with simple structs).
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(ErrorResponse{Error: code, Message: message})
+		*bp = buf
+		bufPool.Put(bp)
+		return
+	}
+
+	_ = buf // keep linter happy
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(data)
+
+	*bp = buf
+	bufPool.Put(bp)
 }
 
 // Unauthorized responds with a 401 error.

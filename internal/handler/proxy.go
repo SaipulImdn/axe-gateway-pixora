@@ -79,6 +79,12 @@ func (h *ProxyHandler) newProxy(target *url.URL, streaming bool) *httputil.Rever
 				pr.Out.Header.Set("Authorization", auth)
 			}
 
+			// Inject authenticated user ID so downstream services can
+			// identify the caller without parsing the JWT themselves.
+			if uid, ok := middleware.GetUserID(pr.Out.Context()); ok {
+				pr.Out.Header.Set("X-User-ID", uid)
+			}
+
 			if clientIP := middleware.GetClientIP(pr.Out.Context()); clientIP != "" {
 				pr.Out.Header.Set("X-Forwarded-For", clientIP)
 			}

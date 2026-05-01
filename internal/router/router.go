@@ -18,8 +18,9 @@ func Setup(cfg *config.Config, rdb *redis.Client, logger *zap.Logger) http.Handl
 	// Create proxy handlers for each backend service
 	pixoraProxy := handler.NewProxyHandler(cfg.Backend.PixoraURL, cfg.Proxy, logger)
 	clockwerkProxy := handler.NewProxyHandler(cfg.Backend.ClockwerkURL, cfg.Proxy, logger)
+	spectreProxy := handler.NewProxyHandler(cfg.Backend.SpectreURL, cfg.Proxy, logger)
 
-	health := service.NewHealthChecker(rdb, cfg.Backend.PixoraURL, cfg.Backend.ClockwerkURL, logger)
+	health := service.NewHealthChecker(rdb, cfg.Backend, logger)
 	rateLimiter := middleware.NewRateLimiter(rdb, cfg.RateLimit, logger)
 
 	mux := http.NewServeMux()
@@ -40,7 +41,9 @@ func Setup(cfg *config.Config, rdb *redis.Client, logger *zap.Logger) http.Handl
 	mux.Handle("/api/v1/drive/", clockwerkProxy)
 	mux.Handle("/api/v1/sync/", clockwerkProxy)
 	mux.Handle("/api/v1/duplicates/", clockwerkProxy)
-	mux.Handle("/api/v1/faces/", clockwerkProxy)
+
+	// ── Routes to spectre-face ───────────────────────────────────
+	mux.Handle("/api/v1/faces/", spectreProxy)
 
 	// Middleware chain (outermost first):
 	// Recovery → CORS → Logger → RateLimiter → Auth → mux

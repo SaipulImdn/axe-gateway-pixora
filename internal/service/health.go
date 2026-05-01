@@ -14,6 +14,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 
+	"github.com/SaipulImdn/axe-gateway-pixora/internal/config"
 	"github.com/SaipulImdn/axe-gateway-pixora/internal/dto"
 )
 
@@ -32,6 +33,7 @@ type HealthChecker struct {
 	rdb          *redis.Client
 	pixoraURL    string
 	clockwerkURL string
+	spectreURL   string
 	httpClient   *http.Client
 	logger       *zap.Logger
 
@@ -48,11 +50,12 @@ type cachedHealth struct {
 }
 
 // NewHealthChecker creates a new HealthChecker with a dedicated HTTP client.
-func NewHealthChecker(rdb *redis.Client, pixoraURL, clockwerkURL string, logger *zap.Logger) *HealthChecker {
+func NewHealthChecker(rdb *redis.Client, backend config.BackendConfig, logger *zap.Logger) *HealthChecker {
 	return &HealthChecker{
 		rdb:          rdb,
-		pixoraURL:    pixoraURL,
-		clockwerkURL: clockwerkURL,
+		pixoraURL:    backend.PixoraURL,
+		clockwerkURL: backend.ClockwerkURL,
+		spectreURL:   backend.SpectreURL,
 		httpClient: &http.Client{
 			Timeout: 5 * time.Second,
 			Transport: &http.Transport{
@@ -112,7 +115,8 @@ func (h *HealthChecker) getCachedOrRefresh(ctx context.Context) *cachedHealth {
 	result := h.check(ctx)
 
 	status := http.StatusOK
-	if result.PixoraBackend == statusDown || result.ClockwerkMedia == statusDown || result.Redis == statusDown {
+	if result.PixoraBackend == statusDown || result.ClockwerkMedia == statusDown ||
+		result.SpectreFace == statusDown || result.Redis == statusDown {
 		status = http.StatusServiceUnavailable
 	}
 
@@ -127,9 +131,9 @@ func (h *HealthChecker) getCachedOrRefresh(ctx context.Context) *cachedHealth {
 
 // check returns the aggregated health status of all dependencies in parallel.
 func (h *HealthChecker) check(ctx context.Context) dto.HealthResponse {
-	var pixoraStatus, clockwerkStatus, redisStatus string
+	var pixoraStatus, clockwerkStatus, spectreStatus, redisStatus string
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(4)
 
 	go func() {
 		defer wg.Done()
@@ -138,6 +142,10 @@ func (h *HealthChecker) check(ctx context.Context) dto.HealthResponse {
 	go func() {
 		defer wg.Done()
 		clockwerkStatus = h.checkURL(ctx, h.clockwerkURL)
+	}()
+	go func() {
+		defer wg.Done()
+		spectreStatus = h.checkURL(ctx, h.spectreURL)
 	}()
 	go func() {
 		defer wg.Done()
@@ -150,6 +158,7 @@ func (h *HealthChecker) check(ctx context.Context) dto.HealthResponse {
 		Gateway:        statusOK,
 		PixoraBackend:  pixoraStatus,
 		ClockwerkMedia: clockwerkStatus,
+		SpectreFace:    spectreStatus,
 		Redis:          redisStatus,
 	}
 }

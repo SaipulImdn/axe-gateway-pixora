@@ -51,6 +51,7 @@ func main() {
 			zap.String("address", cfg.Address()),
 			zap.String("pixora_backend", cfg.Backend.PixoraURL),
 			zap.String("clockwerk_media", cfg.Backend.ClockwerkURL),
+			zap.String("spectre_face", cfg.Backend.SpectreURL),
 		)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Fatal("server failed", zap.Error(err))

@@ -27,7 +27,8 @@ type GatewayConfig struct {
 // BackendConfig holds upstream service URLs.
 type BackendConfig struct {
 	PixoraURL    string // Auth, Activity, Favorites, Notifications, Share
-	ClockwerkURL string // Drive, Sync, Duplicates, Faces
+	ClockwerkURL string // Drive, Sync, Duplicates
+	SpectreURL   string // Faces (detection, recognition, grouping)
 }
 
 // JWTConfig holds JWT validation settings.
@@ -72,6 +73,7 @@ func Load() (*Config, error) {
 	v.SetDefault("GATEWAY_PORT", "9090")
 	v.SetDefault("PIXORA_BACKEND_URL", "https://inappropriate-vanessa-pixora-435590e7.koyeb.app")
 	v.SetDefault("CLOCKWERK_MEDIA_URL", "http://localhost:8081")
+	v.SetDefault("SPECTRE_FACE_URL", "http://localhost:8082")
 	v.SetDefault("JWT_SECRET", "")
 	v.SetDefault("REDIS_URL", "redis://localhost:6379")
 	v.SetDefault("RATE_LIMIT_PUBLIC", 60)
@@ -92,6 +94,7 @@ func Load() (*Config, error) {
 		Backend: BackendConfig{
 			PixoraURL:    v.GetString("PIXORA_BACKEND_URL"),
 			ClockwerkURL: v.GetString("CLOCKWERK_MEDIA_URL"),
+			SpectreURL:   v.GetString("SPECTRE_FACE_URL"),
 		},
 		JWT: JWTConfig{
 			Secret: v.GetString("JWT_SECRET"),

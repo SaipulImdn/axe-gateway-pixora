@@ -3,10 +3,12 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -104,7 +106,9 @@ func (h *ProxyHandler) newProxy(target *url.URL, streaming bool) *httputil.Rever
 		Transport: sharedTransport,
 
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			// Context cancellation during streaming is normal (client disconnect).
+			// Context cancellation by the client (e.g. disconnect during
+			// streaming) is expected — log at debug and don't write a response
+			// because the client is already gone.
 			if r.Context().Err() != nil {
 				h.logger.Debug("proxy request cancelled",
 					zap.String("path", r.URL.Path),
@@ -112,6 +116,15 @@ func (h *ProxyHandler) newProxy(target *url.URL, streaming bool) *httputil.Rever
 				)
 				return
 			}
+
+			// Distinguish timeout from other proxy errors so the client
+			// gets the correct 504 instead of a generic 502.
+			if isTimeout(err) {
+				h.logger.Warn("proxy timeout", zap.Error(err), zap.String("path", r.URL.Path))
+				dto.GatewayTimeout(w)
+				return
+			}
+
 			h.logger.Error("proxy error", zap.Error(err), zap.String("path", r.URL.Path))
 			dto.BadGateway(w, "Backend service is unavailable.")
 		},
@@ -127,6 +140,8 @@ func (h *ProxyHandler) newProxy(target *url.URL, streaming bool) *httputil.Rever
 }
 
 // ServeHTTP routes the request to the appropriate proxy based on the path.
+// Binary/streaming paths (upload, download, thumbnail) use the streaming proxy
+// with longer timeouts. Everything else uses the default proxy.
 func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		if rec := recover(); rec != nil {
@@ -140,18 +155,36 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	path := r.URL.Path
 
-	if strings.Contains(path, "/upload") || strings.Contains(path, "/download") {
-		timeout := h.timeoutUpload
-		if strings.Contains(path, "/download") {
-			timeout = h.timeoutDownload
-		}
-		ctx, cancel := context.WithTimeout(r.Context(), timeout)
+	switch {
+	case strings.Contains(path, "/upload"):
+		ctx, cancel := context.WithTimeout(r.Context(), h.timeoutUpload)
 		defer cancel()
 		h.uploadProxy.ServeHTTP(w, r.WithContext(ctx))
-		return
-	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), h.timeoutDefault)
-	defer cancel()
-	h.defaultProxy.ServeHTTP(w, r.WithContext(ctx))
+	case strings.Contains(path, "/download"), strings.Contains(path, "/thumbnail"):
+		ctx, cancel := context.WithTimeout(r.Context(), h.timeoutDownload)
+		defer cancel()
+		h.uploadProxy.ServeHTTP(w, r.WithContext(ctx))
+
+	default:
+		ctx, cancel := context.WithTimeout(r.Context(), h.timeoutDefault)
+		defer cancel()
+		h.defaultProxy.ServeHTTP(w, r.WithContext(ctx))
+	}
+}
+
+// isTimeout returns true when the error (or any wrapped error) indicates a
+// timeout — context deadline exceeded, net.Error timeout, or OS timeout.
+func isTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	return false
 }
